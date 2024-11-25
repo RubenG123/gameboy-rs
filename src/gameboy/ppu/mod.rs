@@ -38,7 +38,9 @@ pub struct Ppu {
 
     ly_153_early: bool,
 
-    power_on_line_0: bool
+    power_on_line_0: bool,
+
+    last_mode_3_cycles: u64,
 }
 
 pub struct Sprite {
@@ -151,6 +153,8 @@ impl Ppu {
             ly_153_early: false,
 
             power_on_line_0: true,
+
+            last_mode_3_cycles: 0
         }
     }
 
@@ -450,7 +454,24 @@ impl Ppu {
                     self.set_mode_lcdc(PpuMode::VRAM);
                 }
 
-                if self.fifo_tick() {
+                if self.fifo_tick_2() {
+                    let ly = self.get_scan_line();
+                    match ly {
+                        64 => {
+                            if self.mode_clock_cycles != self.last_mode_3_cycles {
+                                println!("mode 3 cycles: t-{} m-{} diff-172: {}", 
+                                    self.mode_clock_cycles, 
+                                    self.mode_clock_cycles as f32 / 4.0,
+                                    self.mode_clock_cycles as i32 - 172 as i32
+                                );
+                                self.last_mode_3_cycles = self.mode_clock_cycles;
+                            }
+                        }
+                        
+                        _ => { }
+                    }
+
+                    
                     self.mode_clock_cycles = 0;
 
                     self.mode = PpuMode::HBlank;
@@ -497,6 +518,97 @@ impl Ppu {
         false
     }
 
+    fn fifo_tick_2(&mut self) -> bool {
+        if self.mode_clock_cycles <= 5 {
+            return false;
+        }
+
+        let mmu = (*self.mmu).borrow();
+        
+        let ldlc_flags = mmu.io[0x40];
+        let scan_line = mmu.io[0x44];
+        let scroll_x: u8 = mmu.io[0x43];
+
+        // sprite handling
+        if self.fifo_sprite_fetch {
+            let sprite = self.fifo_sprite_buffer_peek.as_ref().unwrap();
+            self.sprite_fetcher.tick(&mut self.sprite_fifo, &sprite);
+            if self.sprite_fetcher.cycle == 6 {
+                self.fifo_sprite_fetch = false;
+                self.fifo_sprite_buffer_peek = self.fifo_sprite_buffer.pop_front();
+            } else {
+                return false;
+            }
+        }
+
+        if ldlc_flags & LcdControlFlag::OBJEnable as u8 != 0 && self.fifo_sprite_buffer_peek.is_some() {
+            let candidate_sprite = self.fifo_sprite_buffer_peek.as_ref().unwrap();
+
+            // needs to be a while??
+            // many sprites can be on the same x pos
+            // ppu cannot stall whilst bg_fetcher is busy, the fetcher is considered busy during
+            // the first 5 t cycles of its period. 
+            if candidate_sprite.x as usize <= self.fifo_current_x + 8 {
+                if self.bg_fetcher.cycle <= 5 || self.bg_fifo.len() == 0 {
+                    // statll
+
+                    let window_line_counter = self.window_internal_line_counter.wrapping_sub(1);
+                    self.bg_fetcher.tick(&mut self.bg_fifo, window_line_counter);
+                    return false;
+                }
+
+                // self.bg_fetcher.cycle = 1; // reset bg fetcher
+
+                // pause pixel pushing and bg fetcher
+                // and start sprite fetcher
+                self.fifo_sprite_fetch = true; 
+                self.sprite_fetcher.cycle = 0;
+                return false;
+            }
+        }
+
+        let window_line_counter = self.window_internal_line_counter.wrapping_sub(1);
+        self.bg_fetcher.tick(&mut self.bg_fifo, window_line_counter);
+
+        if self.bg_fifo.len() == 0 {
+            return false;
+        }
+
+        let mut color_bit = self.bg_fifo.pop_front().unwrap();
+
+        // scx skipping
+        if !self.fifo_wy_ly_equal && self.fifo_scx_skipped < scroll_x & 7 {
+            self.fifo_scx_skipped += 1;
+            return false;
+        }
+        
+        // bg enable check, if not, then color bit 0
+        let bg_enabled = ldlc_flags & LcdControlFlag::BGEnable as u8 != 0;
+        if !bg_enabled && !self.fifo_wy_ly_equal {
+            color_bit = 0;
+        }
+
+        let mut color = mmu.bg_palette[color_bit as usize];
+
+        // sprite checking
+        let sprite_pixel = self.sprite_fifo.pop_front();
+        if sprite_pixel.is_some() {
+            let sprite_pixel = sprite_pixel.unwrap();
+
+            let skip = (sprite_pixel.belowbg && color_bit != 0) || sprite_pixel.sprite_color_bit == 0;
+
+            if !skip {
+                color = mmu.sprite_palette[sprite_pixel.sprite_palette][sprite_pixel.sprite_color_bit as usize];
+            }
+        }
+
+        let fb_offset = (scan_line as usize * 160) + self.fifo_current_x;
+        self.frame_buffer[fb_offset] = color;
+        self.fifo_current_x += 1;
+
+        return self.fifo_current_x == 160 
+    }
+
     // This will probably return a bool to say we've drawn the whole line,
     // so we know when to change ppu modes
     fn fifo_tick(&mut self) -> bool {
@@ -524,7 +636,14 @@ impl Ppu {
 
             // needs to be a while??
             // many sprites can be on the same x pos
+            // ppu cannot stall whilst bg_fetcher is busy, the fetcher is considered busy during
+            // the first 5 t cycles of its period. 
             if candidate_sprite.x as usize <= self.fifo_current_x + 8 {
+                if self.bg_fetcher.cycle <= 5 {
+                    // statll
+                    return false;
+                }
+
                 self.bg_fetcher.cycle = 1; // reset bg fetcher
 
                 // pause pixel pushing and bg fetcher

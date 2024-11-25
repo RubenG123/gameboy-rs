@@ -149,10 +149,12 @@ impl BgFetcher {
             6 => {
                 // fetch high byte
                 // the first time we reach here we go back to step 1
-                if !self.reset_on_first_step_3 {
-                    self.reset_on_first_step_3 = true;
-                    self.cycle = 1;
-                }
+
+                // lets just NOP the first 6 cycles of mode 3?
+                // if !self.reset_on_first_step_3 {
+                //     self.reset_on_first_step_3 = true;
+                //     self.cycle = 0;
+                // }
 
                 let mmu = (*self.mmu).borrow();
                 self.high_data = mmu.gpu_vram[(self.tile_data_addr + 1 - 0x8000) as usize];
@@ -168,7 +170,7 @@ impl BgFetcher {
                         pixel_fifo.push_back(color_bit);
                     }
 
-                    self.cycle = 1;
+                    self.cycle = 0;
                     self.tile_counter += 1;
                 }
             }
